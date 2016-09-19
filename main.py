@@ -1,93 +1,192 @@
-
-# Imports
-import pandas as pd
 import numpy as np
-from pandas import Series,DataFrame
+import pandas as pd
+from pandas import DataFrame
+from patsy import dmatrices
+import string
+from operator import itemgetter
+import json
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cross_validation import cross_val_score
+from sklearn.pipeline import Pipeline
+from sklearn.grid_search import GridSearchCV
+from sklearn.cross_validation import train_test_split,StratifiedShuffleSplit,StratifiedKFold
+from sklearn import preprocessing
+from sklearn.metrics import classification_report
+from sklearn.externals import joblib
 
-data_train = pd.read_csv("train.csv")
-#print data_train.columns
-#print data_train.info()
-#print data_train.describe()
+train_file="train.csv"
+MODEL_PATH="./"
+test_file = "test.csv"
+SUBMISSION_PATH = "./"
+seed = 0
 
-import matplotlib.pyplot as plt
-fig = plt.figure()
-fig.set(alpha=0.3)
+def report(grid_scores, n_top=3):
+    top_scores = sorted(grid_scores, key=itemgetter(1), reverse=True)[:n_top]
+    for i, score in enumerate(top_scores):
+        print ("Model with rank : {0}".format(i+1))
+        print("Mean validation score: {0:.3f} (std: {1:.3f})".format(
+              score.mean_validation_score,
+              np.std(score.cv_validation_scores)))
+        print("Parameters: {0}".format(score.parameters))
+        print("")
 
-plt.subplot2grid((2,3), (0,0))
-data_train.Survived.value_counts().plot(kind='bar')
-plt.title(u"Survive(1,Survived)")
-plt.ylabel(u'Count')
-#plt.show()
 
-plt.subplot2grid((2,3), (0,1))
-data_train.Pclass.value_counts().plot(kind='bar')
-plt.ylabel(u'Count')
-plt.title(u'Prank')
 
-plt.subplot2grid((2,3), (0,2))
-plt.scatter(data_train.Survived, data_train.Age)
-plt.ylabel(u'Age')
-plt.grid(b=True, which='major', axis='y')
-plt.title(u'Survived by age(1, Survived)')
 
-plt.subplot2grid((2,3), (1,0), colspan=2)
-data_train.Age[data_train.Pclass == 1].plot(kind='kde')
-data_train.Age[data_train.Pclass == 2].plot(kind='kde')
-data_train.Age[data_train.Pclass == 3].plot(kind='kde')
-plt.xlabel(u'Age')
-plt.ylabel(u'density')
-plt.title(u'Age of all Pclass')
-plt.legend((u'class_1', u'class_2',u'class_3'), loc='best')
 
-plt.subplot2grid((2,3), (1, 2))
-data_train.Embarked.value_counts().plot(kind='bar')
-plt.title(u'COunt of Embarked')
-plt.ylabel(u'COunt')
-#plt.show()
+#clean data
+def substrings_in_string(big_string, substrings):
+    for substring in substrings:
+        if string.find(big_string, substring) != -1:
+            return substring
+    print big_string
+    return np.nan
+le = preprocessing.LabelEncoder()
+enc = preprocessing.OneHotEncoder()
 
-fig = plt.figure()
-fig.set(alpha=0.2)
 
-Survived_0 = data_train.Pclass[data_train.Survived == 0].value_counts()
-Survived_1 = data_train.Pclass[data_train.Survived == 1].value_counts()
-df = pd.DataFrame({u'Survived':Survived_1, 'unsurvived':Survived_0})
-df.plot(kind='bar', stacked=True)
-plt.title(u'Pclass of all')
-plt.xlabel(u'Survive of all')
-plt.ylabel(u'Count')
-#plt.show()
+def clean_and_munge_data(df):
+    #missing words
+    df.Fare = df.Fare.map(lambda x:np.nan if x == 0 else x)
+    title_list = ['Mrs', 'Mr', 'Master', 'Miss', 'Major', 'Rev',
+                'Dr', 'Ms', 'Mlle','Col', 'Capt', 'Mme', 'Countess',
+                'Don', 'Jonkheer']
+    df['Title']=df['Name'].map(lambda x: substrings_in_string(x, title_list))
 
-fig = plt.figure()
-fig.set(alpha=0.2)
-Survived_0 = data_train.Embarked[data_train.Survived == 0].value_counts()
-Survived_1 = data_train.Embarked[data_train.Survived == 1].value_counts()
-df = pd.DataFrame({u'Survived':Survived_1, u'Unsurvived':Survived_0})
-df.plot(kind='bar', stacked=True)
-plt.title(u'Survive of all Embarked')
-plt.xlabel(u'Embarked')
-plt.ylabel(u'Count')
-#plt.show()
+    def replace_titles(x):
+        title = x['Title']
+        if title in ['Mr','Don', 'Major', 'Capt', 'Jonkheer', 'Rev', 'Col']:
+            return 'Mr'
+        elif title in ['Master']:
+            return 'Master'
+        elif title in ['Countess', 'Mme','Mrs']:
+            return 'Mrs'
+        elif title in ['Mlle', 'Ms','Miss']:
+            return 'Miss'
+        elif title =='Dr':
+            if x['Sex']=='Male':
+                return 'Mr'
+            else:
+                return 'Mrs'
+        elif title =='':
+            if x['Sex']=='Male':
+                return 'Master'
+            else:
+                return 'Miss'
+        else:
+            return title
+    df['Title'] = df.apply(replace_titles, axis=1)
 
-fig = plt.figure()
-fig.set(alpha=0.2)
-Survived_m = data_train.Survived[data_train.Sex == 'male'].value_counts()
-Survived_f = data_train.Survived[data_train.Sex == 'female'].value_counts()
-df = pd.DataFrame({u'male':Survived_m, u'female':Survived_f})
-df.plot(kind='bar', stacked=True)
-plt.title('Survive by Sex')
-plt.xlabel('Count')
-plt.show()
+    df['Family_Size']=df['SibSp']+df['Parch']
+    df['Family']=df['SibSp']*df['Parch']
 
-fig = plt.figure()
-fig.set(alpha=0.65)
-plt.title(u'Survive by Pclass and Sex')
+    df.loc[ (df.Fare.isnull())&(df.Pclass==1),'Fare'] =np.median(df[df['Pclass'] == 1]['Fare'].dropna())
+    df.loc[ (df.Fare.isnull())&(df.Pclass==2),'Fare'] =np.median( df[df['Pclass'] == 2]['Fare'].dropna())
+    df.loc[ (df.Fare.isnull())&(df.Pclass==3),'Fare'] = np.median(df[df['Pclass'] == 3]['Fare'].dropna())
 
-ax1 = fig.add_subplot(141)
-data_train.Survived[data_train.Sex == 'female'][data_train.Pclass != 3].value_counts().plot(kind='bar', label="female highclass",  color='#FA2479')
-ax1.set_xticklabels([u'Survived', u'Unsurvived'], rotation=0)
-ax1.legend([u'female/highclass'], loc='best')
+    df['Gender'] = df['Sex'].map({'female':0, 'male':1}).astype(int)
 
-ax2 = fig.add_subplot(142, sharey=ax1)
-data_train.Survived[data_train.Sex == 'female'][data_train.Pclass == 3].value_counts().plot(kind='bar', label='female, low class', color='pink')
-ax2.set_xticklabels([u"Unsurvived", u"Survived"], rotation=0)
-plt.legend([u"female/lowclass"], loc='best')
+    df['AgeFill'] = df['Age']
+    mean_ages = np.zeros(4)
+    mean_ages[0]=np.average(df[df['Title'] == 'Miss']['Age'].dropna())
+    mean_ages[1]=np.average(df[df['Title'] == 'Mrs']['Age'].dropna())
+    mean_ages[2]=np.average(df[df['Title'] == 'Mr']['Age'].dropna())
+    mean_ages[3]=np.average(df[df['Title'] == 'Master']['Age'].dropna())
+    df.loc[ (df.Age.isnull()) & (df.Title == 'Miss') ,'AgeFill'] = mean_ages[0]
+    df.loc[ (df.Age.isnull()) & (df.Title == 'Mrs') ,'AgeFill'] = mean_ages[1]
+    df.loc[ (df.Age.isnull()) & (df.Title == 'Mr') ,'AgeFill'] = mean_ages[2]
+    df.loc[ (df.Age.isnull()) & (df.Title == 'Master') ,'AgeFill'] = mean_ages[3]
+
+    df['AgeCat']=df['AgeFill']
+    df.loc[ (df.AgeFill<=10) ,'AgeCat'] = 'child'
+    df.loc[ (df.AgeFill>60),'AgeCat'] = 'aged'
+    df.loc[ (df.AgeFill>10) & (df.AgeFill <=30) ,'AgeCat'] = 'adult'
+    df.loc[ (df.AgeFill>30) & (df.AgeFill <=60) ,'AgeCat'] = 'senior'
+
+    df.Embarked = df.Embarked.fillna('S')
+
+    df.loc[ df.Cabin.isnull() == True, 'Cabin'] = 0.5
+    df.loc[ df.Cabin.isnull() == False, 'Cabin'] = 1.5
+
+    df['Fare_Per_Person'] = df['Fare'] / (df['Family_Size']+1)
+
+    #Age times class
+
+    df['AgeClass']=df['AgeFill']*df['Pclass']
+    df['ClassFare']=df['Pclass']*df['Fare_Per_Person']
+
+    df['HighLow'] = df['Pclass']
+    df.loc[ (df.Fare_Per_Person < 8), 'HighLow'] = 'Low'
+    df.loc[ (df.Fare_Per_Person > 8), 'HighLow'] = 'High'
+
+
+    le.fit(df['Sex'] )
+    x_sex=le.transform(df['Sex'])
+    df['Sex']=x_sex.astype(np.float)
+
+    le.fit( df['Ticket'])
+    x_Ticket=le.transform( df['Ticket'])
+    df['Ticket']=x_Ticket.astype(np.float)
+
+    le.fit(df['Title'])
+    x_title=le.transform(df['Title'])
+    df['Title'] =x_title.astype(np.float)
+
+    le.fit(df['HighLow'])
+    x_hl=le.transform(df['HighLow'])
+    df['HighLow']=x_hl.astype(np.float)
+
+
+    le.fit(df['AgeCat'])
+    x_age=le.transform(df['AgeCat'])
+    df['AgeCat'] =x_age.astype(np.float)
+
+    le.fit(df['Embarked'])
+    x_emb=le.transform(df['Embarked'])
+    df['Embarked']=x_emb.astype(np.float)
+
+    df = df.drop(['PassengerId', 'Name', 'Age', 'Cabin'], axis=1)
+
+    return df
+
+
+traindf=pd.read_csv(train_file)
+
+
+df=clean_and_munge_data(traindf)
+
+formula_ml='Survived~Pclass+C(Title)+Sex+C(AgeCat)+Fare_Per_Person+Fare+Family_Size'
+
+y_train, x_train = dmatrices(formula_ml, data=df, return_type='dataframe')
+y_train = np.asarray(y_train).ravel()
+print y_train.shape, x_train.shape
+
+X_train, X_test, Y_train, Y_test = train_test_split(x_train, y_train, test_size=0.2, random_state=seed)
+
+clf = RandomForestClassifier(n_estimators=500, criterion='entropy', max_depth=5, min_samples_split=1,
+                             min_samples_leaf=1, max_features='auto', bootstrap=False, oob_score=False,
+                             n_jobs=1, random_state=seed,
+                             verbose=0)
+param_grid = dict()
+
+pipeline = Pipeline([('clf', clf)])
+grid_search = GridSearchCV(pipeline, param_grid=param_grid, verbose=3,scoring='accuracy',\
+cv=StratifiedShuffleSplit(Y_train, n_iter=10, test_size=0.2, train_size=None,  \
+random_state=seed)).fit(X_train, Y_train)
+print ("Best Score:%0.3f" %grid_search.best_score_)
+print (grid_search.best_estimator_)
+report(grid_search.grid_scores_)
+
+print ('--------------grid search end ---------------')
+print ('on all train set')
+scores = cross_val_score(grid_search.best_estimator_, x_train, y_train, cv=3, scoring='accuracy')
+print scores.mean(), scores
+print ('on test set')
+scores = cross_val_score(grid_search.best_estimator_,X_test, Y_test, cv=3, scoring='accuracy')
+print scores.mean(), scores
+
+
+print(classification_report(Y_train, grid_search.best_estimator_.predict(X_train) ))
+print('test data')
+print(classification_report(Y_test, grid_search.best_estimator_.predict(X_test) ))
+
